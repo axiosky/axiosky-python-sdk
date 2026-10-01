@@ -22,7 +22,7 @@ setup(
     name="axiosky",
     version=VERSION,
     description="Python SDK for Axiosky AI Governance Control Plane",
-    packages=find_packages(),
+    packages=find_packages(include=["axiosky", "axiosky.*"]),
     install_requires=[
         "httpx>=0.24.0",
     ],

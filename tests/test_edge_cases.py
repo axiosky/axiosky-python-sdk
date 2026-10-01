@@ -73,15 +73,12 @@ class TestVerifyParameter:
         assert gov.verify is False
 
     def test_verify_string_path(self, tmp_path):
-        # Copy the system CA bundle so httpx can load a real cert file.
+        # Use httpx's certifi bundle so this test also runs on Windows.
         import shutil
-        from pathlib import Path
+        import certifi
 
-        system_ca = Path("/etc/ssl/certs/ca-certificates.crt")
-        if not system_ca.exists():
-            pytest.skip("system CA bundle not available")
         ca_file = tmp_path / "ca-bundle.pem"
-        shutil.copy(system_ca, ca_file)
+        shutil.copy(certifi.where(), ca_file)
         gov = Governor(
             api_key="k", base_url="http://test.local",
             verify=str(ca_file),

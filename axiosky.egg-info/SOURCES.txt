@@ -1,8 +1,0 @@
-setup.py
-axiosky/__init__.py
-axiosky/client.py
-axiosky.egg-info/PKG-INFO
-axiosky.egg-info/SOURCES.txt
-axiosky.egg-info/dependency_links.txt
-axiosky.egg-info/requires.txt
-axiosky.egg-info/top_level.txt

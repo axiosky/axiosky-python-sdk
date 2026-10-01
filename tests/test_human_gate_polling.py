@@ -27,6 +27,24 @@ from tests.conftest import (
 # ---------------------------------------------------------------------------
 # execute() returns pending — NOT executed
 # ---------------------------------------------------------------------------
+def test_unconfirmed_delivery_is_a_bounded_operator_outcome():
+    calls = []
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json={'execution_status': 'delivery_unconfirmed'})
+    gov = make_governor(handler)
+    assert gov.wait_for_decision('decision-1', timeout=1)['execution_status'] == 'delivery_unconfirmed'
+    assert len(calls) == 1
+    gov.close()
+
+
+@pytest.mark.asyncio
+async def test_async_unconfirmed_delivery_stops_waiting():
+    gov = make_async_governor(lambda request: httpx.Response(200, json={'execution_status': 'delivery_unconfirmed'}))
+    assert (await gov.wait_for_decision('decision-1', timeout=1))['execution_status'] == 'delivery_unconfirmed'
+    await gov.aclose()
+
+
 class TestExecuteReturnsPending:
     """HITL: execute() returns execution_status='pending_human_review'."""
 

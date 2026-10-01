@@ -832,8 +832,8 @@ class Governor(_GovernorBase):
         URL on APPROVE. The server creates a pending human-confirmation
         record (an escalation with ``origin='human_gate'``) and returns
         immediately with ``execution_status='pending_human_review'``.
-        The target URL is fired ONLY when a human explicitly approves
-        the confirmation via the dashboard.
+        A human approval queues delivery. Only the contracted receiver
+        acknowledgement confirms completed business execution.
 
         The returned ``Decision`` has:
           - ``execution_status='pending_human_review'`` (non-terminal —
@@ -921,6 +921,7 @@ class Governor(_GovernorBase):
     # Module-level constant — the set of execution_status values that
     # indicate the lifecycle is complete (no further polling needed).
     _TERMINAL_EXECUTION_STATUSES = frozenset({
+        "delivery_unconfirmed",  # bounded stop: operator reconciliation required
         "executed",
         "blocked_by_human",
         "failed",
@@ -1632,31 +1633,51 @@ def governed(
     agent_id: Optional[str] = None,
     tenant_id: Optional[str] = None,
     payload_fn: Optional[Callable[..., Dict[str, Any]]] = None,
+    target_url: Optional[str] = None,
+    enforcement: str = "human_gate",
+    timeout: float = 60.0,
+    poll_interval: float = 1.0,
     _axiosky_governor: Optional[Union[Governor, AsyncGovernor]] = None,
     **governor_kwargs: Any,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Decorator that gates a function through a ``Governor``.
 
-    The wrapped function runs ONLY if the governor returns APPROVE.
-    BLOCK raises ``GovernanceDeniedError``; ESCALATE raises
-    ``GovernanceEscalatedError``.
+    SECURITY (changed): the default, ``enforcement="human_gate"``, routes
+    through ``/v1/execute`` exactly like the dashboard-approved flow. The
+    wrapped function runs ONLY after a human has approved AND the target
+    has been confirmed executed (terminal ``execution_status == "executed"``).
+    A rejection, expiry, or block raises ``GovernanceDeniedError`` and the
+    wrapped function never runs. An ambiguous outcome (``failed``,
+    ``delivery_unconfirmed``) raises ``AxioskyError`` rather than silently
+    skipping or silently running the function.
 
-    The ``Governor`` (or ``AsyncGovernor``) instance must be supplied
-    either at decoration time or at call time via the
-    ``_axiosky_governor`` keyword. The name is prefixed with
-    ``_axiosky_`` to avoid colliding with the wrapped function's own
-    kwargs (e.g. if the function already takes a ``governor`` arg).
+    ``enforcement="evaluate_only"`` restores the previous behavior: the
+    wrapped function runs immediately on an APPROVE from ``evaluate()``,
+    with NO human ever confirming it. This bypasses human review entirely.
+    Use it only for genuinely low-risk, reversible, non-financial actions
+    where you have deliberately decided human review is unnecessary — it
+    is an explicit, opt-in escape hatch, not the default, and every call
+    logs a warning so this can't be silently relied on in production.
 
     Sync vs async is auto-detected via ``inspect.iscoroutinefunction``.
 
-    Example::
+    Example (default, human-gated)::
 
-        @governed("data_export", tenant_id="acme")
-        def export_user_data(user_id):
+        @governed("loan_disbursal", target_url="https://core.bank/disburse")
+        def on_approved_disbursal(loan_id):
+            # Runs only after a human approved AND the disbursal target
+            # confirmed execution. Use this for side effects (notify,
+            # update local records) — the actual money movement already
+            # happened via the pinned target_url, server-side.
             ...
 
-        # Governor supplied at call time:
-        export_user_data(user_id=42, _axiosky_governor=gov)
+    Example (explicit unsafe opt-out)::
+
+        @governed("data_export", enforcement="evaluate_only")
+        def export_user_data(user_id):
+            # Runs on a policy APPROVE with no human involved. Only use
+            # this for actions you've decided don't need a human.
+            ...
 
     Args:
         action_type: the governance action type to evaluate.
@@ -1667,11 +1688,40 @@ def governed(
             ``(args, kwargs)`` and returns the payload dict. If
             ``None``, a minimal ``{"function": qualname}`` payload is
             used.
+        target_url: required when ``enforcement="human_gate"`` (the
+            default). The URL Axiosky will call, server-side, only
+            after a human approves — never called by this decorator
+            directly.
+        enforcement: ``"human_gate"`` (default, enforces human
+            approval before the wrapped function runs) or
+            ``"evaluate_only"`` (explicit opt-out, no human review).
+        timeout: seconds to wait for a human decision in
+            ``"human_gate"`` mode before raising (default 60).
+        poll_interval: seconds between polls while waiting (default 1).
         _axiosky_governor: the Governor / AsyncGovernor to use. May
             also be passed at call time.
-        **governor_kwargs: forwarded to ``evaluate()`` (e.g.
-            ``environment``, ``fallback``, ``idempotency_key``).
+        **governor_kwargs: forwarded to ``evaluate()`` / ``execute()``
+            (e.g. ``environment``, ``fallback``, ``idempotency_key``).
     """
+    if enforcement not in ("human_gate", "evaluate_only"):
+        raise ValueError(
+            "@governed: enforcement must be 'human_gate' (default, "
+            "enforces human approval before the wrapped function runs) "
+            "or 'evaluate_only' (explicit opt-out, no human review)."
+        )
+    if enforcement == "human_gate" and not target_url:
+        raise ValueError(
+            "@governed(..., enforcement='human_gate') requires target_url "
+            "— the URL Axiosky calls, server-side, once a human approves. "
+            "If you deliberately want the old evaluate()-only behavior "
+            "with NO human review, pass enforcement='evaluate_only' "
+            "explicitly."
+        )
+
+    _DENIED_STATUSES = frozenset({
+        "blocked_by_human", "expired_auto_blocked", "rejected_no_execution",
+    })
+
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         qualname = getattr(func, "__qualname__", None) or func.__name__
         effective_agent_id = agent_id or qualname
@@ -1679,7 +1729,6 @@ def governed(
         if inspect.iscoroutinefunction(func):
             @functools.wraps(func)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-                # Pop the governor kwarg (call-time override).
                 gov = kwargs.pop(
                     "_axiosky_governor", _axiosky_governor
                 )
@@ -1694,20 +1743,56 @@ def governed(
                     payload = payload_fn(*args, **kwargs)
                 else:
                     payload = {"function": qualname}
-                decision = await gov.evaluate(
+
+                if enforcement == "evaluate_only":
+                    logger.warning(
+                        "@governed(%r, enforcement='evaluate_only'): "
+                        "running %r WITHOUT human confirmation — this "
+                        "mode bypasses the /v1/execute human gate by "
+                        "design.",
+                        action_type, qualname,
+                    )
+                    decision = await gov.evaluate(
+                        agent_id=effective_agent_id,
+                        action_type=action_type,
+                        tenant_id=tenant_id,
+                        payload=payload,
+                        **governor_kwargs,
+                    )
+                    status = DecisionStatus.from_value(decision.status)
+                    if status is DecisionStatus.APPROVE:
+                        return await func(*args, **kwargs)
+                    if status is DecisionStatus.BLOCK:
+                        raise GovernanceDeniedError(decision)
+                    raise GovernanceEscalatedError(decision)
+
+                decision = await gov.execute(
                     agent_id=effective_agent_id,
                     action_type=action_type,
+                    target_url=target_url,
                     tenant_id=tenant_id,
                     payload=payload,
                     **governor_kwargs,
                 )
-                status = DecisionStatus.from_value(decision.status)
-                if status is DecisionStatus.APPROVE:
+                if decision.execution_status == "shadow_skipped":
                     return await func(*args, **kwargs)
-                if status is DecisionStatus.BLOCK:
+                final = await gov.wait_for_decision(
+                    decision.decision_id,
+                    timeout=timeout,
+                    poll_interval=poll_interval,
+                )
+                exec_status = final.get("execution_status")
+                if exec_status == "executed":
+                    return await func(*args, **kwargs)
+                if exec_status in _DENIED_STATUSES:
                     raise GovernanceDeniedError(decision)
-                # ESCALATE
-                raise GovernanceEscalatedError(decision)
+                raise AxioskyError(
+                    0,
+                    f"@governed: decision {decision.decision_id} ended "
+                    f"in execution_status={exec_status!r} — wrapped "
+                    f"function NOT run. This requires manual "
+                    f"reconciliation.",
+                )
 
             return async_wrapper
 
@@ -1727,19 +1812,55 @@ def governed(
                 payload = payload_fn(*args, **kwargs)
             else:
                 payload = {"function": qualname}
-            decision = gov.evaluate(
+
+            if enforcement == "evaluate_only":
+                logger.warning(
+                    "@governed(%r, enforcement='evaluate_only'): "
+                    "running %r WITHOUT human confirmation — this "
+                    "mode bypasses the /v1/execute human gate by "
+                    "design.",
+                    action_type, qualname,
+                )
+                decision = gov.evaluate(
+                    agent_id=effective_agent_id,
+                    action_type=action_type,
+                    tenant_id=tenant_id,
+                    payload=payload,
+                    **governor_kwargs,
+                )
+                status = DecisionStatus.from_value(decision.status)
+                if status is DecisionStatus.APPROVE:
+                    return func(*args, **kwargs)
+                if status is DecisionStatus.BLOCK:
+                    raise GovernanceDeniedError(decision)
+                raise GovernanceEscalatedError(decision)
+
+            decision = gov.execute(
                 agent_id=effective_agent_id,
                 action_type=action_type,
+                target_url=target_url,
                 tenant_id=tenant_id,
                 payload=payload,
                 **governor_kwargs,
             )
-            status = DecisionStatus.from_value(decision.status)
-            if status is DecisionStatus.APPROVE:
+            if decision.execution_status == "shadow_skipped":
                 return func(*args, **kwargs)
-            if status is DecisionStatus.BLOCK:
+            final = gov.wait_for_decision(
+                decision.decision_id,
+                timeout=timeout,
+                poll_interval=poll_interval,
+            )
+            exec_status = final.get("execution_status")
+            if exec_status == "executed":
+                return func(*args, **kwargs)
+            if exec_status in _DENIED_STATUSES:
                 raise GovernanceDeniedError(decision)
-            raise GovernanceEscalatedError(decision)
+            raise AxioskyError(
+                0,
+                f"@governed: decision {decision.decision_id} ended in "
+                f"execution_status={exec_status!r} — wrapped function "
+                f"NOT run. This requires manual reconciliation.",
+            )
 
         return sync_wrapper
 
